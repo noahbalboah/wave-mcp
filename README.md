@@ -24,11 +24,14 @@ FastMCP, env-var auth, no dependencies beyond `mcp` and `requests`.
 | `wave_products` | Product/service catalog with unit prices — your price list. |
 | `wave_estimates` | Estimates/quotes (sales pipeline) with status, totals, deposit status. |
 | `wave_list_businesses` | List businesses (id, name, currency) to discover a `business_name`. |
+| `wave_create_expense` | **The one write tool.** Books a business expense (increase an expense account, funded from an account — defaults to owner equity for personally-paid purchases). Dry-run by default; `confirm=True` to post. Deterministic idempotency key prevents duplicates. |
 
 ## Scope & limits (deliberate)
 
-- **Read-only.** Querying is the safe surface; create/send/edit tools are a
-  possible v2.
+- **Read-only except one guarded write** (`wave_create_expense`): dry-run
+  default, explicit `confirm=True` to post, deterministic `externalId` so an
+  identical call can't duplicate. Every other tool only queries. Money
+  transactions can't be read back via the API, so verify writes in Wave's UI.
 - Wave's public API has **no money-transaction (bank-ledger) endpoint and no
   date-filterable P&L report.** But account *balances* and invoice *payments*
   ARE exposed, so `wave_profit_and_loss` / `wave_chart_of_accounts` give real

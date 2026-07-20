@@ -15,11 +15,14 @@ Auth is via env var only — never hardcoded:
                            business on the account.
 
 Scope / deliberate limits:
-  * READ-ONLY. No create/send/edit/delete tools — querying is the safe surface.
-  * The public API has NO money-transaction (bank-ledger) endpoint and NO
-    date-filterable P&L report. BUT account *balances* ARE exposed, so P&L and
-    expense breakdowns are available as CUMULATIVE-TO-DATE figures (not scoped
-    to an arbitrary date range). Invoice *payments* are also fully exposed.
+  * READ-ONLY except for ONE guarded write tool (wave_create_expense), which
+    books a business expense and defaults to a dry run — nothing is written
+    without an explicit confirm=True. Every other tool only queries.
+  * The public API has NO money-transaction READ endpoint (you can create a
+    money transaction but not query it back) and NO date-filterable P&L report.
+    BUT account *balances* ARE exposed, so P&L and expense breakdowns are
+    available as CUMULATIVE-TO-DATE figures (not scoped to an arbitrary date
+    range). Invoice *payments* are also fully exposed.
 
 GraphQL quirks handled here so callers don't have to:
   * Inline string args are rejected — every string/ID arg goes through
@@ -28,6 +31,7 @@ GraphQL quirks handled here so callers don't have to:
   * Money values come back as comma-formatted strings ("1,050.00"); Decimal
     scalars (balances, unit prices) come back as plain strings ("88121.84").
 """
+import hashlib
 import os
 from datetime import date, datetime, timedelta
 
@@ -322,12 +326,37 @@ def wave_revenue(
 
 
 def _all_accounts(business_id: str) -> list[dict]:
-    """Every ledger account with its current balance and classification."""
+    """Every ledger account with its id, current balance and classification."""
     body = """
-      name description type { name normalBalanceType } subtype { name }
+      id name description type { name normalBalanceType } subtype { name }
       balance isArchived
     """
     return _all_nodes(business_id, "accounts", body, page_size=200)
+
+
+def _resolve_account(business_id: str, name: str) -> dict:
+    """Resolve an account name to {id, name, type} by unique match.
+
+    Prefers an exact (case-insensitive) name match; falls back to substring.
+    Raises if nothing matches or if the match is ambiguous — so a write can
+    never silently hit the wrong account (Wave auto-creates many identically
+    named 'Accounts Receivable' sub-accounts).
+    """
+    key = (name or "").lower().strip()
+    live = [a for a in _all_accounts(business_id) if not a.get("isArchived")]
+    exact = [a for a in live if (a.get("name") or "").lower() == key]
+    pool = exact or [a for a in live if key and key in (a.get("name") or "").lower()]
+    uniq = list({a["id"]: a for a in pool}.values())
+    if not uniq:
+        raise ValueError(f"No non-archived account matching {name!r}.")
+    if len(uniq) > 1:
+        names = sorted({a["name"] for a in uniq})
+        raise ValueError(
+            f"Account {name!r} is ambiguous — matches {len(uniq)}: {names[:12]}. "
+            "Use the exact account name."
+        )
+    a = uniq[0]
+    return {"id": a["id"], "name": a["name"], "type": (a.get("type") or {}).get("name")}
 
 
 @mcp.tool()
@@ -536,6 +565,103 @@ def wave_estimates(status: str = "", business_name: str = DEFAULT_BUSINESS) -> d
         "count": len(rows),
         "total_value": round(sum(r["total"] for r in rows), 2),
         "estimates": rows,
+    }
+
+
+@mcp.tool()
+def wave_create_expense(
+    amount: float,
+    expense_account: str,
+    date: str,
+    description: str,
+    paid_from: str = "Owner Investment",
+    notes: str = "",
+    confirm: bool = False,
+    business_name: str = DEFAULT_BUSINESS,
+) -> dict:
+    """Record a business EXPENSE in Wave. THE ONLY WRITE TOOL — all others read.
+
+    Books a balanced money transaction: increases `expense_account` and funds it
+    from `paid_from`. `paid_from` defaults to owner equity ("Owner Investment /
+    Drawings") — the correct source when YOU paid personally (e.g. on a personal
+    card) for a business purchase, recording it as an owner contribution. Pass a
+    bank / credit-card account name for `paid_from` if it was paid from an
+    account Wave already tracks.
+
+    SAFETY (read before using):
+      * confirm=False (default) is a DRY RUN. It resolves the accounts and
+        returns the exact entry it WILL post, writing NOTHING. Review it, then
+        call again with confirm=True to actually book it.
+      * externalId is derived deterministically from (date, amount, description),
+        so an identical call cannot create a duplicate.
+      * Wave's public API can neither READ money transactions back nor edit or
+        delete them — moneyTransactionCreate is the only money-transaction
+        mutation. So a posted entry can only be corrected in Wave's UI. Get it
+        right here (the dry run is for exactly that), then verify in the UI.
+
+    amount: positive number. date: "YYYY-MM-DD". expense_account / paid_from are
+    account-name matches that must each resolve to exactly one account.
+    """
+    if amount is None or float(amount) <= 0:
+        raise ValueError("amount must be a positive number.")
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        raise ValueError(f"date must be YYYY-MM-DD, got {date!r}.")
+
+    bid = _resolve_business_id(business_name)
+    exp = _resolve_account(bid, expense_account)
+    src = _resolve_account(bid, paid_from)
+    amt = round(float(amount), 2)
+    ext = "wave-mcp-" + hashlib.sha1(
+        f"{bid}|{date}|{amt:.2f}|{description}".encode()
+    ).hexdigest()[:24]
+
+    plan = {
+        "date": date,
+        "amount": amt,
+        "description": description,
+        "notes": notes or None,
+        "increase_expense": {"account": exp["name"], "account_id": exp["id"]},
+        "funded_by": {"account": src["name"], "account_id": src["id"], "direction": "WITHDRAWAL"},
+        "external_id": ext,
+    }
+    if not confirm:
+        return {
+            "dry_run": True,
+            "will_post": plan,
+            "next_step": "Review, then call again with confirm=True to book it.",
+        }
+
+    mutation = """
+    mutation Create($input: MoneyTransactionCreateInput!) {
+      moneyTransactionCreate(input: $input) {
+        didSucceed
+        inputErrors { path message code }
+        transaction { id }
+      }
+    }
+    """
+    inp = {
+        "businessId": bid,
+        "externalId": ext,
+        "date": date,
+        "description": description,
+        "anchor": {"accountId": src["id"], "amount": amt, "direction": "WITHDRAWAL"},
+        "lineItems": [
+            {"accountId": exp["id"], "amount": amt, "balance": "INCREASE", "taxes": []}
+        ],
+    }
+    if notes:
+        inp["notes"] = notes
+    res = _gql(mutation, {"input": inp})["moneyTransactionCreate"]
+    return {
+        "dry_run": False,
+        "did_succeed": res.get("didSucceed"),
+        "input_errors": res.get("inputErrors") or [],
+        "transaction_id": (res.get("transaction") or {}).get("id"),
+        "posted": plan,
+        "verify_in": "Wave UI → Accounting → Transactions (API can't read it back).",
     }
 
 
